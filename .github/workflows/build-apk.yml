@@ -1,4 +1,4 @@
-Name: Build Abu Raed Chat APK
+name: Build Abu Raed Chat APK
 
 on:
   workflow_dispatch:
