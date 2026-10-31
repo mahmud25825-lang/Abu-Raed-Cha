@@ -6,6 +6,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,9 +26,9 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.10.2'
+          gradle-version: '8.9'
 
-      - name: Create Android Project
+      - name: Generate Android Project
         run: |
           mkdir -p app/src/main/java/com/aburaed/chat
 
@@ -38,7 +41,6 @@ jobs:
               }
           }
           dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
               repositories {
                   google()
                   mavenCentral()
@@ -50,7 +52,7 @@ jobs:
 
           cat > build.gradle.kts <<'EOF'
           plugins {
-              id("com.android.application") version "8.8.0" apply false
+              id("com.android.application") version "8.7.3" apply false
               id("org.jetbrains.kotlin.android") version "2.0.21" apply false
           }
           EOF
@@ -72,6 +74,15 @@ jobs:
                   versionCode = 1
                   versionName = "1.0"
               }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
           }
           EOF
 
@@ -79,22 +90,17 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET"/>
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
-              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
-
               <application
                   android:theme="@android:style/Theme.Material.Light.NoActionBar"
                   android:label="شات أبو رعد"
                   android:usesCleartextTraffic="true">
-
                   <activity
                       android:name=".MainActivity"
                       android:exported="true">
-
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
-
                   </activity>
               </application>
           </manifest>
@@ -105,22 +111,266 @@ jobs:
 
           import android.app.Activity
           import android.os.Bundle
-          import android.graphics.Color
+          import android.os.Handler
+          import android.os.Looper
           import android.view.Gravity
-          import android.widget.TextView
-          import android.widget.LinearLayout
+          import android.widget.*
+          import java.io.*
+          import java.net.*
+          import java.util.Collections
+          import java.util.concurrent.CopyOnWriteArrayList
 
           class MainActivity : Activity() {
+
+              private val port = 8988
+              private val ui = Handler(Looper.getMainLooper())
+              private val clients = CopyOnWriteArrayList<PrintWriter>()
+
+              private var server: ServerSocket? = null
+              private var clientWriter: PrintWriter? = null
+              private var clientSocket: Socket? = null
+
+              private lateinit var log: TextView
+              private lateinit var input: EditText
+              private lateinit var address: EditText
+              private lateinit var status: TextView
+
+              private val prefs by lazy {
+                  getSharedPreferences("chat", MODE_PRIVATE)
+              }
+
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
 
-                  val layout = LinearLayout(this)
-                  layout.orientation = LinearLayout.VERTICAL
-                  layout.gravity = Gravity.CENTER
-                  layout.setBackgroundColor(Color.rgb(235,245,240))
-                  layout.setPadding(25,25,25,25)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(16, 16, 16, 16)
 
                   val title = TextView(this)
                   title.text = "شات أبو رعد"
-                  title.textSize = 30f
-                  title.setTextColor(Color.rgb(7,
+                  title.textSize = 26f
+                  title.gravity = Gravity.CENTER
+
+                  status = TextView(this)
+                  status.text = "دردشة محلية بدون إنترنت"
+
+                  val host = Button(this)
+                  host.text = "تشغيل المجموعة"
+                  host.setOnClickListener { startHost() }
+
+                  address = EditText(this)
+                  address.hint = "اكتب IP المضيف"
+
+                  val connect = Button(this)
+                  connect.text = "اتصال بالمضيف"
+                  connect.setOnClickListener { connectHost() }
+
+                  log = TextView(this)
+                  log.textSize = 16f
+                  log.text = prefs.getString("history", "") ?: ""
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(log)
+
+                  input = EditText(this)
+                  input.hint = "اكتب رسالتك"
+
+                  val send = Button(this)
+                  send.text = "إرسال"
+                  send.setOnClickListener { sendMessage() }
+
+                  root.addView(title)
+                  root.addView(status)
+                  root.addView(host)
+                  root.addView(address)
+                  root.addView(connect)
+                  root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+                  root.addView(input)
+                  root.addView(send)
+
+                  setContentView(root)
+              }
+
+              private fun startHost() {
+                  Thread {
+                      try {
+                          if (server != null) return@Thread
+
+                          val ss = ServerSocket(port)
+                          server = ss
+
+                          ui.post {
+                              status.text = "عنوان IP: ${localIp()}:$port"
+                              addMessage("تم تشغيل المجموعة")
+                          }
+
+                          while (!ss.isClosed) {
+                              val peer = ss.accept()
+                              Thread { handlePeer(peer) }.start()
+                          }
+
+                      } catch (e: Exception) {
+                          ui.post {
+                              addMessage("خطأ: ${e.message}")
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun handlePeer(peer: Socket) {
+                  var out: PrintWriter? = null
+
+                  try {
+                      out = PrintWriter(
+                          OutputStreamWriter(peer.getOutputStream(), Charsets.UTF_8),
+                          true
+                      )
+
+                      clients.add(out)
+
+                      val reader = BufferedReader(
+                          InputStreamReader(peer.getInputStream(), Charsets.UTF_8)
+                      )
+
+                      ui.post {
+                          addMessage("انضم جهاز جديد")
+                      }
+
+                      while (true) {
+                          val message = reader.readLine() ?: break
+                          ui.post { addMessage(message) }
+                          broadcast(message)
+                      }
+
+                  } catch (_: Exception) {
+                  } finally {
+                      if (out != null) clients.remove(out)
+                      try { peer.close() } catch (_: Exception) {}
+                  }
+              }
+
+              private fun connectHost() {
+                  val host = address.text.toString().trim()
+
+                  if (host.isEmpty()) {
+                      addMessage("اكتب عنوان IP أولاً")
+                      return
+                  }
+
+                  Thread {
+                      try {
+                          val s = Socket(host, port)
+                          clientSocket = s
+
+                          val out = PrintWriter(
+                              OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8),
+                              true
+                          )
+
+                          clientWriter = out
+
+                          val reader = BufferedReader(
+                              InputStreamReader(s.getInputStream(), Charsets.UTF_8)
+                          )
+
+                          ui.post {
+                              status.text = "متصل بالمضيف"
+                              addMessage("تم الاتصال بنجاح")
+                          }
+
+                          while (true) {
+                              val message = reader.readLine() ?: break
+                              ui.post { addMessage(message) }
+                          }
+
+                      } catch (e: Exception) {
+                          ui.post {
+                              addMessage("فشل الاتصال: ${e.message}")
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun sendMessage() {
+                  val message = input.text.toString().trim()
+                  if (message.isEmpty()) return
+
+                  val line = "عضو: $message"
+
+                  if (server != null) {
+                      addMessage("أنا: $message")
+                      broadcast(line)
+                  } else {
+                      val out = clientWriter
+
+                      if (out == null) {
+                          addMessage("اتصل بالمضيف أولاً")
+                          return
+                      }
+
+                      out.println(line)
+                      addMessage("أنا: $message")
+                  }
+
+                  input.setText("")
+              }
+
+              private fun broadcast(message: String) {
+                  clients.forEach {
+                      try {
+                          it.println(message)
+                      } catch (_: Exception) {
+                          clients.remove(it)
+                      }
+                  }
+              }
+
+              private fun addMessage(message: String) {
+                  ui.post {
+                      val old = log.text.toString()
+                      val updated = if (old.isEmpty()) message
+                          else "$old\n$message"
+
+                      log.text = updated.takeLast(20000)
+
+                      prefs.edit()
+                          .putString("history", log.text.toString())
+                          .apply()
+                  }
+              }
+
+              private fun localIp(): String {
+                  try {
+                      val interfaces =
+                          Collections.list(NetworkInterface.getNetworkInterfaces())
+
+                      for (network in interfaces) {
+                          for (ip in Collections.list(network.inetAddresses)) {
+                              if (!ip.isLoopbackAddress && ip is Inet4Address) {
+                                  return ip.hostAddress ?: "غير معروف"
+                              }
+                          }
+                      }
+                  } catch (_: Exception) {
+                  }
+
+                  return "غير معروف"
+              }
+
+              override fun onDestroy() {
+                  try { clientSocket?.close() } catch (_: Exception) {}
+                  try { server?.close() } catch (_: Exception) {}
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Abu-Raed-Chat-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error                  title.setTextColor(Color.rgb(7,
